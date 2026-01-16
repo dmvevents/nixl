@@ -574,6 +574,12 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_enable failed for rail " + std::to_string(rail_id));
         }
 
+        // Store inject size for small message optimization (fi_injectdata)
+        // Messages smaller than inject_size can use inline injection for lower latency
+        inject_size_ = info->tx_attr ? info->tx_attr->inject_size : 0;
+        NIXL_INFO << "Rail " << rail_id << " inject_size=" << inject_size_
+                  << " bytes (fi_injectdata threshold)";
+
         // Get endpoint name for this rail
         size_t ep_name_len = sizeof(ep_name);
         ret = fi_getname(&endpoint->fid, ep_name, &ep_name_len);
@@ -1082,9 +1088,6 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Prepare descriptor
-    void *desc = fi_mr_desc(req->mr);
-
     NIXL_TRACE << "Sending data on endpoint=" << endpoint << " buffer=" << req->buffer
                << " size=" << req->buffer_size << " immediate_data=" << std::hex << immediate_data
                << " msg_type=" << NIXL_GET_MSG_TYPE_FROM_IMM(immediate_data)
@@ -1092,7 +1095,54 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
                << " XFER_ID=" << NIXL_GET_XFER_ID_FROM_IMM(immediate_data)
                << " dest_addr=" << dest_addr << std::dec << " context=" << &req->ctx;
 
-    // Retry indefinitely until senddata succeeds or fails for all providers
+    // OPTIMIZATION: Use fi_injectdata for small messages
+    // fi_injectdata completes synchronously (no CQ entry) and is faster for small messages
+    // because it avoids memory registration and completion queue overhead
+    if (inject_size_ > 0 && req->buffer_size <= inject_size_) {
+        int ret = -FI_EAGAIN;
+        int attempt = 0;
+
+        while (true) {
+            // fi_injectdata: no desc or context needed, completes synchronously
+            ret = fi_injectdata(endpoint, req->buffer, req->buffer_size, immediate_data, dest_addr);
+
+            if (ret == 0) {
+                // Success - inject completes synchronously, so call callback and release immediately
+                NIXL_TRACE << "Send injected successfully (size=" << req->buffer_size
+                           << " <= inject_size=" << inject_size_ << ")"
+                           << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" : "");
+
+                // Call completion callback immediately since inject completes synchronously
+                if (req->completion_callback) {
+                    req->completion_callback();
+                }
+                // Release request immediately - no CQ entry will be generated
+                releaseRequest(req);
+                return NIXL_SUCCESS;
+            }
+
+            if (ret == -FI_EAGAIN) {
+                attempt++;
+                if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
+                    NIXL_INFO << "fi_injectdata still retrying EAGAIN on rail " << rail_id
+                              << " after " << attempt << " attempts";
+                }
+                int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
+                                        NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
+                progressCompletionQueue(false);
+                usleep(delay_us);
+                continue;
+            } else {
+                // Fall through to regular send on other errors
+                NIXL_TRACE << "fi_injectdata failed with " << fi_strerror(-ret)
+                           << ", falling back to fi_senddata";
+                break;
+            }
+        }
+    }
+
+    // Standard path: use fi_senddata with completion tracking
+    void *desc = fi_mr_desc(req->mr);
     int ret = -FI_EAGAIN;
     int attempt = 0;
 

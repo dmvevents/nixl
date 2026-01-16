@@ -404,6 +404,10 @@ private:
     // Provider capability flags
     bool provider_supports_hmem_;
 
+    // Inject size for small message optimization (fi_injectdata)
+    // Messages <= inject_size_ can use fi_injectdata for lower latency
+    size_t inject_size_;
+
 
     nixl_status_t
     processCompletionQueueEntry(struct fi_cq_data_entry *comp) const;

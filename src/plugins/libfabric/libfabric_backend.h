@@ -126,6 +126,39 @@ public:
     friend class nixlLibfabricRail;
 };
 
+/**
+ * @brief Host-prepared memory view for the libfabric backend.
+ *
+ * Mirrors the UCX plugin's dlist -> device-mem-list handle shape
+ * (see src/plugins/ucx/mem_list.{h,cpp} and ucx_backend.cpp:1477/1492): the
+ * host walks a descriptor list once, snapshots the per-element RDMA-reachability
+ * data (addr, per-rail remote keys, connection), and returns an opaque
+ * nixlMemViewH that a GPU-side kernel can later consume element-by-element.
+ *
+ * HONEST CEILING (do not inflate): libfabric has NO ucp_device_put analogue --
+ * there is no GPU-callable RDMA post on EFA today (GDAKI is kernel-gated on
+ * rdma-core#1701 + efa_linux_3.2+, both OPEN as of 2026-07-24). This handle is
+ * therefore the *host-prepared address book* consumed by the CPU-proxy post
+ * path; the device .cuh (src/api/gpu/libfabric/nixl_device.cuh) routes through
+ * that proxy and swaps to native GPU-initiated posts only when the kernel gate
+ * opens. NEVER quote a proxy transfer as a GPU-native measurement.
+ */
+class nixlLibfabricMemView {
+public:
+    /** One entry per descriptor in the prepared dlist. */
+    struct Element {
+        uint64_t addr; // Local or remote buffer base address for this element
+        size_t length; // Element length in bytes
+        bool is_remote; // true = remote (peer) memory, false = local memory
+        std::vector<uint64_t> rail_remote_key_list; // Per-rail remote keys (remote elements only)
+        std::vector<size_t> selected_rails; // Rails reachable for this element
+        std::shared_ptr<nixlLibfabricConnection> conn; // Connection (remote elements only)
+    };
+
+    bool is_remote_view; // Whether this view was built from a remote dlist
+    std::vector<Element> elements; // Snapshot, index-aligned with the source dlist
+};
+
 /** Request handle for multi-rail transfer operations */
 class nixlLibfabricBackendH : public nixlBackendReqH {
 private:
@@ -573,6 +606,49 @@ public:
      */
     nixl_status_t
     genNotif(const std::string &remote_agent, const std::string &msg) const override;
+
+    // Device-API memory views (mirrors the UCX plugin's prepMemView overloads).
+    /**
+     * @brief Prepare a memory view for remote buffers.
+     *
+     * Snapshots the remote descriptor list (addresses, per-rail remote keys,
+     * connection) into an opaque nixlMemViewH that the device .cuh consumes.
+     * PROXY until GDAKI gate opens: libfabric has no GPU-callable RDMA post, so
+     * the returned view feeds the CPU-proxy post path, not native GPU posts.
+     *
+     * @param[in]  dlist    Remote descriptor list to snapshot
+     * @param[out] mvh      Opaque memory-view handle (nixlLibfabricMemView *)
+     * @param[in]  opt_args Optional backend arguments (unused today)
+     * @return NIXL_SUCCESS on success, error code on failure
+     */
+    nixl_status_t
+    prepMemView(const nixl_remote_meta_dlist_t &dlist,
+                nixlMemViewH &mvh,
+                const nixl_opt_b_args_t *opt_args = nullptr) const override;
+
+    /**
+     * @brief Prepare a memory view for local buffers.
+     *
+     * Local-side counterpart of the remote overload; snapshots local buffer
+     * addresses for the CPU-proxy post path. PROXY until GDAKI gate opens.
+     *
+     * @param[in]  dlist    Local descriptor list to snapshot
+     * @param[out] mvh      Opaque memory-view handle (nixlLibfabricMemView *)
+     * @param[in]  opt_args Optional backend arguments (unused today)
+     * @return NIXL_SUCCESS on success, error code on failure
+     */
+    nixl_status_t
+    prepMemView(const nixl_meta_dlist_t &dlist,
+                nixlMemViewH &mvh,
+                const nixl_opt_b_args_t *opt_args = nullptr) const override;
+
+    /**
+     * @brief Release a memory view handle prepared by prepMemView().
+     *
+     * @param[in] mem_view Handle returned by prepMemView()
+     */
+    void
+    releaseMemView(nixlMemViewH mem_view) const override;
 
     // Receiver Side XFER_ID Tracking Helper Methods
     /**

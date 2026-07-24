@@ -1374,6 +1374,100 @@ nixlLibfabricEngine::genNotif(const std::string &remote_agent, const std::string
     return notifSendPriv(remote_agent, notifications, total_msg_len, 0, 0);
 }
 
+/****************************************
+ * Device-API memory views
+ *
+ * PROXY until GDAKI gate opens. These overrides mirror the UCX plugin's
+ * prepMemView shape (src/plugins/ucx/ucx_backend.cpp:1477/1492 + mem_list.cpp):
+ * walk the descriptor list once and snapshot the per-element RDMA-reachability
+ * data into an opaque nixlMemViewH. Unlike UCX -- which hands the snapshot to
+ * ucp_device_put on the GPU -- libfabric has NO GPU-callable RDMA post today, so
+ * this view feeds the CPU-proxy post path. It swaps to native GPU-initiated
+ * posts only when the kernel gate opens (rdma-core#1701 + efa_linux_3.2+, both
+ * OPEN as of 2026-07-24). NEVER quote a proxy transfer as a GPU-native number.
+ *****************************************/
+
+nixl_status_t
+nixlLibfabricEngine::prepMemView(const nixl_remote_meta_dlist_t &dlist,
+                                 nixlMemViewH &mvh,
+                                 const nixl_opt_b_args_t *opt_args) const {
+    try {
+        auto view = std::make_unique<nixlLibfabricMemView>();
+        view->is_remote_view = true;
+        view->elements.reserve(dlist.descCount());
+
+        for (const auto &desc : dlist) {
+            nixlLibfabricMemView::Element elem;
+            elem.addr = static_cast<uint64_t>(desc.addr);
+            elem.length = desc.len;
+            elem.is_remote = true;
+
+            // A null-agent descriptor is a placeholder (mirrors UCX's
+            // nixl_null_agent field_mask=0 skip); leave it unpopulated.
+            if (desc.remoteAgent == nixl_null_agent) {
+                view->elements.emplace_back(std::move(elem));
+                continue;
+            }
+
+            const auto md = static_cast<const nixlLibfabricPublicMetadata *>(desc.metadataP);
+            if (!md) {
+                NIXL_ERROR << "No public metadata found in remote descriptor";
+                return NIXL_ERR_BACKEND;
+            }
+
+            elem.rail_remote_key_list = md->rail_remote_key_list_;
+            elem.selected_rails = md->remote_selected_endpoints_;
+            elem.conn = md->conn_;
+            view->elements.emplace_back(std::move(elem));
+        }
+
+        mvh = view.release();
+        return NIXL_SUCCESS;
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "Failed to prepare remote memory view: " << e.what();
+        return NIXL_ERR_BACKEND;
+    }
+}
+
+nixl_status_t
+nixlLibfabricEngine::prepMemView(const nixl_meta_dlist_t &dlist,
+                                 nixlMemViewH &mvh,
+                                 const nixl_opt_b_args_t *opt_args) const {
+    try {
+        auto view = std::make_unique<nixlLibfabricMemView>();
+        view->is_remote_view = false;
+        view->elements.reserve(dlist.descCount());
+
+        for (const auto &desc : dlist) {
+            const auto md = static_cast<const nixlLibfabricPrivateMetadata *>(desc.metadataP);
+            if (!md) {
+                NIXL_ERROR << "No private metadata found in local descriptor";
+                return NIXL_ERR_BACKEND;
+            }
+
+            nixlLibfabricMemView::Element elem;
+            elem.addr = static_cast<uint64_t>(desc.addr);
+            elem.length = desc.len;
+            elem.is_remote = false;
+            elem.selected_rails = md->selected_rails_;
+            view->elements.emplace_back(std::move(elem));
+        }
+
+        mvh = view.release();
+        return NIXL_SUCCESS;
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "Failed to prepare local memory view: " << e.what();
+        return NIXL_ERR_BACKEND;
+    }
+}
+
+void
+nixlLibfabricEngine::releaseMemView(nixlMemViewH mem_view) const {
+    delete static_cast<nixlLibfabricMemView *>(mem_view);
+}
+
 nixl_status_t
 nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
     if (!progress_thread_enabled_) {

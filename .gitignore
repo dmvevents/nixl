@@ -21,3 +21,6 @@ cufile.log
 
 # Asio
 subprojects/asio-*
+
+# Scratch working files (per global rule)
+scratch/

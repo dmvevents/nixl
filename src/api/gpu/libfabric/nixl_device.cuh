@@ -63,6 +63,29 @@
 #include <cstdint>
 #include <cstdio>
 
+/* =====================================================================================
+ *  Offline syntax-gate shims -- NEVER part of a device build.
+ * =====================================================================================
+ *  The proxy enqueue path below uses a CUDA device intrinsic (__threadfence_system, for
+ *  the release-before-publish ordering) plus the __device__/__forceinline__ qualifiers.
+ *  When this header is validated by a host compiler for a standalone syntax gate (no nvcc
+ *  available offline, per increment-1's `g++ -std=c++17 -fsyntax-only` gate), those do not
+ *  exist. Provide no-op equivalents so the gate can check the enqueue path's STRUCTURE.
+ *  Under real nvcc (__CUDACC__ defined) this whole block is skipped and the true
+ *  intrinsic/qualifiers are used. These shims are a build-gate aid ONLY -- they do NOT
+ *  implement any transport and are never part of a shipped .so/.cubin.
+ */
+#ifndef __CUDACC__
+#ifndef __device__
+#define __device__
+#endif
+#ifndef __forceinline__
+#define __forceinline__ inline
+#endif
+static inline void
+__threadfence_system(void) {}
+#endif // !__CUDACC__
+
 /**
  * @def NIXL_LIBFABRIC_DEVICE_BACKEND
  * @brief Compile-time transport selector for the device channel. See the swap-seam
@@ -121,11 +144,25 @@ struct nixlMemViewElem {
  * @struct nixlLibfabricProxyMailbox
  * @brief Host-visible command mailbox drained by the CPU proxy (PROXY backend only).
  *
- * The device side (this header) fills a slot and bumps @a head; the CPU proxy polls
- * @a head, issues the corresponding fi_write / fi_atomic on the libfabric rails, and
- * writes the paired nixlGpuXferStatusH. This is the SAME architecture as the validated
- * D2H proxy; it is a functional correctness path, NOT a GPU-native post.
+ * The device side (this header) reserves a slot, fills it, and publishes it via the
+ * per-slot @a ready flag; the CPU proxy polls the slot at @a tail, and once @a ready==1
+ * issues the corresponding fi_write / fi_atomic on the libfabric rails (the host
+ * transport is nixlLibfabricRail::postWrite -> fi_writedata, driven by
+ * nixlLibfabricRailManager::prepareAndSubmitTransfer), writes the paired
+ * nixlGpuXferStatusH, then clears @a ready and advances @a tail. This is the SAME
+ * architecture as the validated D2H proxy; it is a functional correctness path,
+ * NOT a GPU-native post.
  *
+ * PUBLICATION ORDERING (why a per-slot @a ready flag, not just @a head): a producer
+ * reserves its slot by atomically bumping @a head, but the payload is written AFTER the
+ * reservation. If the consumer keyed off @a head it could observe an advanced head and
+ * read a half-written Command. Instead each Command carries its own @a ready flag: the
+ * producer writes all fields, issues a system-scope release fence, then sets ready=1
+ * last; the consumer keys off ready (not head). @a head is a pure reservation counter.
+ *
+ * @note The host MUST zero-initialise the whole mailbox (head=tail=0, every Command's
+ *       ready=0) before any kernel posts; a fresh cudaMallocHost/cudaMemset region
+ *       satisfies this.
  * @note SIGNAL/atomic commands must stay exempt from any DATA FIFO budget or they cause
  *       head-of-line blocking behind data writes (banked: nixl-ep-022).
  */
@@ -143,13 +180,92 @@ struct nixlLibfabricProxyMailbox {
         uint32_t channel_id;
         uint64_t flags;
         nixlGpuXferStatusH *status; // Optional; nullptr = fire-and-forget
+        // Publication flag: 0 = slot free / being written, 1 = payload committed and
+        // ready for the CPU proxy. Written LAST by the producer (after a release fence),
+        // cleared by the consumer once the slot is drained. See PUBLICATION ORDERING.
+        volatile uint32_t ready;
     };
 
     static constexpr uint32_t kCapacity = 1024;
     Command commands[kCapacity];
-    volatile uint64_t head; // Bumped by the GPU producer
-    volatile uint64_t tail; // Advanced by the CPU proxy consumer
+    volatile uint64_t head; // Reservation counter, atomically bumped by GPU producers
+    volatile uint64_t tail; // Advanced by the CPU proxy consumer after draining a slot
 };
+
+/**
+ * @brief Enqueue one command into the CPU-proxy mailbox (the shared PROXY transport seam).
+ *
+ * This is the single C++ enqueue path that puts work onto the libfabric CPU proxy. The
+ * device surface (@ref nixlPut / @ref nixlAtomicAdd, PROXY backend) calls it from a GPU
+ * kernel; the SAME seam shape is what the host-side Route-C harness will drive through a
+ * pybind (framework/, nixl-ep-100/103) so ONE enqueue contract serves both callers -- do
+ * NOT fork a second enqueue protocol. The proxy drains a published slot and issues the
+ * transfer via the host transport (nixlLibfabricRail::postWrite -> fi_writedata, through
+ * nixlLibfabricRailManager::prepareAndSubmitTransfer).
+ *
+ * Reserve -> fill -> publish (see PUBLICATION ORDERING on @ref nixlLibfabricProxyMailbox):
+ *   1. reserve a slot index by atomically bumping @a head;
+ *   2. copy the caller's data fields into the slot;
+ *   3. system-scope release fence so the payload is visible before the ready flag;
+ *   4. set the slot's @a ready = 1 last (the consumer keys off ready, never off head).
+ *
+ * @param mailbox [in] Host-visible mailbox (cudaMallocHost / mapped), zero-initialised.
+ * @param cmd     [in] Fully-populated command EXCEPT @a ready (this seam sets it). @a cmd.status,
+ *                     if non-null, must point at GPU-visible memory the proxy can write.
+ *
+ * @return NIXL_IN_PROG     Command published; the proxy will post it and update @a status.
+ * @return NIXL_ERR_BACKEND The mailbox is full (producer outran the proxy) or @a mailbox is null.
+ *
+ * @warning SINGLE-POSTER contract: one owner (warp-leader thread, or one host thread on the
+ *          pybind side) enqueues per mailbox. Multi-poster contention on a shared proxy is a
+ *          banked dead end (NEG: multi-proxy shared-transport 0.49-16 GB/s oscillation,
+ *          fi_cntr single-owner -- nixl-ep-013/019/095). Do NOT fan multiple warps at one mailbox.
+ */
+__device__ __forceinline__ nixl_status_t
+nixlLibfabricProxyEnqueue(nixlLibfabricProxyMailbox *mailbox,
+                          const nixlLibfabricProxyMailbox::Command &cmd) {
+    if (!mailbox) return NIXL_ERR_BACKEND;
+
+    // (1) Reserve a slot. SINGLE-POSTER contract (see @warning): exactly one owner enqueues
+    //     per mailbox, so head is advanced by a plain read-modify-write -- NOT atomicAdd,
+    //     which would falsely imply the banned multi-poster fan-in (nixl-ep-013/019/095)
+    //     and, on a full ring, would skew head past tail permanently (a retrying producer
+    //     would then reject forever). Backpressure first, publish-reservation only on
+    //     success, so head never runs ahead of what actually got enqueued.
+    const uint64_t ticket = mailbox->head;
+    if (ticket - mailbox->tail >= nixlLibfabricProxyMailbox::kCapacity) {
+        return NIXL_ERR_BACKEND; // ring full; caller retries / throttles (head unchanged)
+    }
+    const uint32_t slot = static_cast<uint32_t>(ticket % nixlLibfabricProxyMailbox::kCapacity);
+    nixlLibfabricProxyMailbox::Command &dst = mailbox->commands[slot];
+    mailbox->head = ticket + 1; // commit the reservation (single-poster: no other writer)
+
+    // (2) Fill the data fields (everything except the publication flag).
+    dst.src_mvh = cmd.src_mvh;
+    dst.src_index = cmd.src_index;
+    dst.src_offset = cmd.src_offset;
+    dst.dst_mvh = cmd.dst_mvh;
+    dst.dst_index = cmd.dst_index;
+    dst.dst_offset = cmd.dst_offset;
+    dst.size = cmd.size;
+    dst.atomic_value = cmd.atomic_value;
+    dst.is_atomic = cmd.is_atomic;
+    dst.channel_id = cmd.channel_id;
+    dst.flags = cmd.flags;
+    dst.status = cmd.status;
+    if (cmd.status) {
+        cmd.status->completion_state = 0; // posted / in progress, before publish
+    }
+
+    // (3) Release fence: all field writes above must be visible to the CPU proxy BEFORE
+    //     it can observe ready==1 (banked nixl-ep-014: EFA/host-visible mem needs explicit
+    //     ordering, not volatile alone). __threadfence_system reaches the host.
+    __threadfence_system();
+
+    // (4) Publish last.
+    dst.ready = 1;
+    return NIXL_IN_PROG;
+}
 
 /**
  * @brief Get the status of a previously posted transfer request.
@@ -190,9 +306,14 @@ nixlGpuGetXferStatus(nixlGpuXferStatusH &xfer_status) {
  * @param  channel_id  [in] Channel/rail hint for the transfer.
  * @param  flags       [in] Transfer flags (see @ref nixl_gpu_flags).
  * @param  xfer_status [in,out] Optional status handle (see @ref nixlGpuGetXferStatus).
+ * @param  mailbox     [in] CPU-proxy mailbox threaded through the kernel launch. REQUIRED
+ *                     on the PROXY backend (there is no GPU-native post to fall back to);
+ *                     defaulted to nullptr only to preserve UCX-signature source-compat,
+ *                     so a kernel authored against the UCX device API still compiles here.
+ *                     A UCX-shaped call that omits it gets NIXL_ERR_BACKEND on PROXY.
  *
- * @return NIXL_IN_PROG     Transfer posted (enqueued) successfully.
- * @return NIXL_ERR_BACKEND An error occurred.
+ * @return NIXL_IN_PROG     Transfer enqueued to the proxy; poll @a xfer_status.
+ * @return NIXL_ERR_BACKEND The mailbox is null/full, or the backend reported an error.
  */
 template<nixl_gpu_level_t level = nixl_gpu_level_t::THREAD>
 __device__ inline nixl_status_t
@@ -201,21 +322,27 @@ nixlPut(const nixlMemViewElem &src,
         size_t size,
         unsigned channel_id = 0,
         uint64_t flags = 0,
-        nixlGpuXferStatusH *xfer_status = nullptr) {
+        nixlGpuXferStatusH *xfer_status = nullptr,
+        nixlLibfabricProxyMailbox *mailbox = nullptr) {
 #if NIXL_LIBFABRIC_DEVICE_BACKEND == NIXL_LIBFABRIC_BACKEND_PROXY
-    // PROXY until GDAKI gate opens: enqueue for the CPU fi_write proxy.
-    // A real enqueue needs the mailbox pointer threaded through the kernel launch;
-    // the scaffold documents the contract and returns IN_PROG so callers exercise
-    // the async status path exactly as they would against a native post.
-    (void)src;
-    (void)dst;
-    (void)size;
-    (void)channel_id;
-    (void)flags;
-    if (xfer_status) {
-        xfer_status->completion_state = 0; // posted / in progress
-    }
-    return NIXL_IN_PROG;
+    // PROXY until GDAKI gate opens: enqueue a put onto the CPU fi_writedata proxy via the
+    // shared seam (nixlLibfabricProxyEnqueue). The mailbox is threaded through the kernel
+    // launch, as anticipated by increment-1. This is a functional correctness path, not a
+    // GPU-native post -- NEVER quote a completion latency from it as a GPU-native number.
+    nixlLibfabricProxyMailbox::Command cmd;
+    cmd.src_mvh = src.mvh;
+    cmd.src_index = src.index;
+    cmd.src_offset = src.offset;
+    cmd.dst_mvh = dst.mvh;
+    cmd.dst_index = dst.index;
+    cmd.dst_offset = dst.offset;
+    cmd.size = size;
+    cmd.atomic_value = 0;
+    cmd.is_atomic = 0; // put
+    cmd.channel_id = channel_id;
+    cmd.flags = flags;
+    cmd.status = xfer_status;
+    return nixlLibfabricProxyEnqueue(mailbox, cmd);
 #else
     // PROXY until GDAKI gate opens: native GPU-initiated fi_write does not exist on
     // EFA yet (rdma-core #1701 + efa_linux_3.2+ unmerged). Do NOT enable and claim.
@@ -225,6 +352,7 @@ nixlPut(const nixlMemViewElem &src,
     (void)channel_id;
     (void)flags;
     (void)xfer_status;
+    (void)mailbox;
     return NIXL_ERR_NOT_SUPPORTED;
 #endif
 }
@@ -240,14 +368,18 @@ nixlPut(const nixlMemViewElem &src,
  * @param  channel_id  [in] Channel/rail hint.
  * @param  flags       [in] Transfer flags.
  * @param  xfer_status [in,out] Optional status handle.
+ * @param  mailbox     [in] CPU-proxy mailbox (see @ref nixlPut). REQUIRED on PROXY;
+ *                     defaulted to nullptr only for UCX source-compat.
  *
- * @return NIXL_IN_PROG     Atomic posted (enqueued) successfully.
- * @return NIXL_ERR_BACKEND An error occurred.
+ * @return NIXL_IN_PROG     Atomic enqueued to the proxy; poll @a xfer_status.
+ * @return NIXL_ERR_BACKEND The mailbox is null/full, or the backend reported an error.
  *
  * @warning EFA SRD gives ZERO write ordering and fi_writedata is unsupported (banked
  *          nixl-ep-015): the atomic's visibility relative to prior writes is NOT
  *          guaranteed by the fabric. The proxy must fence explicitly; do not assume
- *          post-order == completion-order.
+ *          post-order == completion-order. Atomics are enqueued through the SAME mailbox
+ *          but the proxy MUST keep them off any DATA FIFO budget (nixl-ep-022) so a
+ *          counter increment cannot head-of-line-block behind bulk data writes.
  */
 template<nixl_gpu_level_t level = nixl_gpu_level_t::THREAD>
 __device__ inline nixl_status_t
@@ -255,17 +387,26 @@ nixlAtomicAdd(uint64_t value,
               const nixlMemViewElem &counter,
               unsigned channel_id = 0,
               uint64_t flags = 0,
-              nixlGpuXferStatusH *xfer_status = nullptr) {
+              nixlGpuXferStatusH *xfer_status = nullptr,
+              nixlLibfabricProxyMailbox *mailbox = nullptr) {
 #if NIXL_LIBFABRIC_DEVICE_BACKEND == NIXL_LIBFABRIC_BACKEND_PROXY
-    // PROXY until GDAKI gate opens: enqueue an atomic command for the CPU proxy.
-    (void)value;
-    (void)counter;
-    (void)channel_id;
-    (void)flags;
-    if (xfer_status) {
-        xfer_status->completion_state = 0; // posted / in progress
-    }
-    return NIXL_IN_PROG;
+    // PROXY until GDAKI gate opens: enqueue an atomic-add command onto the CPU proxy via
+    // the shared seam. The counter is the destination; there is no source buffer, so the
+    // src_* fields are left empty and the addend rides in atomic_value with is_atomic=1.
+    nixlLibfabricProxyMailbox::Command cmd;
+    cmd.src_mvh = nullptr;
+    cmd.src_index = 0;
+    cmd.src_offset = 0;
+    cmd.dst_mvh = counter.mvh;
+    cmd.dst_index = counter.index;
+    cmd.dst_offset = counter.offset;
+    cmd.size = sizeof(uint64_t);
+    cmd.atomic_value = value;
+    cmd.is_atomic = 1; // atomic add
+    cmd.channel_id = channel_id;
+    cmd.flags = flags;
+    cmd.status = xfer_status;
+    return nixlLibfabricProxyEnqueue(mailbox, cmd);
 #else
     // PROXY until GDAKI gate opens: native GPU-initiated atomics unavailable on EFA.
     (void)value;
@@ -273,6 +414,7 @@ nixlAtomicAdd(uint64_t value,
     (void)channel_id;
     (void)flags;
     (void)xfer_status;
+    (void)mailbox;
     return NIXL_ERR_NOT_SUPPORTED;
 #endif
 }

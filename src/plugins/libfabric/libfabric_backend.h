@@ -108,6 +108,30 @@ public:
     friend class nixlLibfabricEngine;
 };
 
+/**
+ * Snapshot of a prepared descriptor list for the device API (prepMemView).
+ *
+ * Proxy-backed: elements carry everything the CPU-proxy post path needs so a
+ * device-side nixlPut can be serviced without re-walking agent metadata.
+ * GPU-native posting swaps in when the EFA kernel gate (GDAKI) opens.
+ * NEVER quote a proxy transfer as a GPU-native measurement.
+ */
+class nixlLibfabricMemView {
+public:
+    /** One entry per descriptor in the prepared dlist. */
+    struct Element {
+        uint64_t addr; // Local or remote buffer base address for this element
+        size_t length; // Element length in bytes
+        bool is_remote; // true = remote (peer) memory, false = local memory
+        std::vector<uint64_t> rail_remote_key_list; // Per-rail remote keys (remote elements only)
+        std::vector<size_t> selected_rails; // Rails reachable for this element
+        std::shared_ptr<nixlLibfabricConnection> conn; // Connection (remote elements only)
+    };
+
+    bool is_remote_view; // Whether this view was built from a remote dlist
+    std::vector<Element> elements; // Snapshot, index-aligned with the source dlist
+};
+
 /** Request handle for multi-rail transfer operations */
 class nixlLibfabricBackendH : public nixlBackendReqH {
 private:
